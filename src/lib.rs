@@ -8,176 +8,182 @@ enum Element {
 }
 
 #[derive(Debug)]
-struct ReadResult {
+#[derive(PartialEq)]
+struct ElementParsed {
     element: Element,
     end_offset: usize,
 }
 
-// TODO: make errors types and attach more useful info to them
-fn read_bytestring(data: &str) -> Result<ReadResult, &'static str> {
+#[derive(Debug)]
+#[derive(PartialEq)]
+enum ParseResult {
+    Ok(ElementParsed),
+    Err(&'static str), // TODO: make errors types and attach more useful info to them
+    None,
+}
+
+#[derive(Debug)]
+#[derive(PartialEq)]
+enum ParsedDocument {
+    Ok(Vec<Element>),
+    Err(&'static str),
+}
+
+fn parse_bytestring(data: &str) -> ParseResult {
     match data.find(":") {
 	Some(size_end) => {
 	    match data[0..size_end].parse::<usize>() {
 		Ok(length) => {
-		    let read_start = size_end + 1;
-		    let read_end = read_start + length;
-		    let element = data[read_start..read_end].to_string();
+		    let parse_start = size_end + 1;
+		    let parse_end = parse_start + length;
+		    let element = data[parse_start..parse_end].to_string();
 
-		    Ok(ReadResult{
+		    ParseResult::Ok(ElementParsed{
 			element: Element::ByteString(element),
-			end_offset: read_end,
+			end_offset: parse_end,
 		    })
 		},
 
-		Err(_) => Err("Can't parse size integer for string"),
+		Err(_) => ParseResult::Err("Can't parse size integer for string"),
 	    }
 	},
-	None => Err("Can't parse bytestring from data: missing ':'"),
+	None => ParseResult::Err("Can't parse bytestring from data: missing ':'"),
     }
 }
 
-fn read_integer(data: &str) -> Result<ReadResult, &'static str> {
+fn parse_integer(data: &str) -> ParseResult {
     if &data[0..1] != "i" { // this looks stupid it can't be right...
-	return Err("Can't parse integer: missing leading 'i'");
+	return ParseResult::Err("Can't parse integer: missing leading 'i'");
     }
 
     match data.find("e") {
 	Some(integer_end) => {
 	    match data[1..integer_end].parse::<i64>() {
 		Ok(element) => {
-		    Ok(ReadResult{
+		    ParseResult::Ok(ElementParsed{
 			element: Element::Integer(element),
 			end_offset: integer_end + 1,
 		    })
 		},
 
-		Err(_) => Err("Can't parse integer")
+		Err(_) => ParseResult::Err("Can't parse integer")
 	    }
 	},
 	    
-	None => Err("Can't parse integer: missing end 'e'"),
+	None => ParseResult::Err("Can't parse integer: missing end 'e'"),
     }
 }
 
-fn read_list(data: &str) -> Result<ReadResult, &'static str> {
+fn parse_list(data: &str) -> ParseResult {
     let mut offset = 0;
     let mut ret: Vec<Element> = Vec::new();
 
     if &data[0..1] != "l" {
-	return Err("Can't parse list: missing leading 'l'");
+	return ParseResult::Err("Can't parse list: missing leading 'l'");
     }
     offset += 1; // trim leading l
 
     while offset < data.len() {
 	match &data[offset..offset+1] {
-	    "e" => return Ok(ReadResult{ 
+	    "e" => return ParseResult::Ok(ElementParsed{ 
 		element: Element::List(ret),
 		end_offset: offset + 1, // trim trailling 'e'
 	    }), 
 	    _ => {
 		match dispatch(&data[offset..]) {
-		    Some(result) => {
-			match result {
-			    Ok(result) => {
-				ret.push(result.element);
-				offset += result.end_offset;
-			    },
-
-			    Err(e) => return Err(e)
-			}
+		    ParseResult::Ok(result) => {
+			ret.push(result.element);
+			offset += result.end_offset;
 		    },
 
-		    None => return Err("Can't parse list: dispatch read 'None'")
+		    ParseResult::Err(e) => return ParseResult::Err(e),
+		
+		    ParseResult::None => return ParseResult::Err("Can't parse list: dispatch parse 'None'"),
 		}
 	    },
 	}
     }
 
-    return Err("Can't parse list: ran out of chars before trailing 'e'");
+    return ParseResult::Err("Can't parse list: ran out of chars before trailing 'e'");
 }
 
-fn read_dict(data: &str) -> Result<ReadResult, &'static str> {
+fn parse_dict(data: &str) -> ParseResult {
     let mut offset = 0;
     let mut ret: Vec<(String, Box<Element>)> = Vec::new();
 
     if &data[0..1] != "d" {
-	return Err("Can't parse list: missing leading 'd'");
+	return ParseResult::Err("Can't parse list: missing leading 'd'");
     }
     offset += 1;
 
     while offset < data.len() {
 	match &data[offset..offset+1] {
-	    "e" => return Ok(ReadResult{
+	    "e" => return ParseResult::Ok(ElementParsed{
 		element: Element::Dict(ret),
 		end_offset: offset + 1, // trim trailing 'e'
 	    }),
 	    _ => {
-		// has to be possible to flatten this out...
-		// maybe re-use from parse?
-		// a type would probably help flatten out the matches, combine the Some and Ok
-		// into ReadResult? <Ok | Err | None>
-		match read_bytestring(&data[offset..]) {
-		    Ok(read_key) => {
-			match read_key.element {
+		match parse_bytestring(&data[offset..]) {
+		    ParseResult::Ok(parse_key) => {
+			match parse_key.element {
 			    Element::ByteString(key) => {
-				match dispatch(&data[read_key.end_offset+1..]) {
-				    Some(result) => {
-					match result {
-					    Ok(result) => {
-						ret.push((key, Box::new(result.element)));
-						offset += result.end_offset + read_key.end_offset
-					    },
-
-					    Err(e) => return Err(e)
-					}
+				match dispatch(&data[parse_key.end_offset+1..]) {
+				    ParseResult::Ok(result) => {
+					ret.push((key, Box::new(result.element)));
+					offset += result.end_offset + parse_key.end_offset
 				    },
 
-				    None => return Err("Can't parse list: dispatch read 'None'")
+				    ParseResult::Err(e) => return ParseResult::Err(e),
+
+				    ParseResult::None => return ParseResult::Err("Can't parse list: dispatch parse 'None'"),
 				}
 			    },
-			    _ => return Err("Can't read dict key: got non bytestring element")
+
+			    _ => return ParseResult::Err("Can't parse dict key: got non bytestring element")
 			}
 		    },
 
-		    Err(_) => return Err("Can't read dict key!")
+		    _ => return ParseResult::Err("Can't parse dict key!")
 		}
 	    },
 	}
     }
 
-    return Err("Can't parse dict: ran out of chars");
+    return ParseResult::Err("Can't parse dict: ran out of chars");
 }
 
-fn dispatch(data: &str) -> Option<Result<ReadResult, &'static str>> {
+fn dispatch(data: &str) -> ParseResult {
     if data.len() <= 0 {
-	return None;
+	return ParseResult::None;
     }
 
     match &data[0..1] {
-	"0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => Some(read_bytestring(data)),
-	"i" => Some(read_integer(data)),
-	"l" => Some(read_list(data)),
-	"d" => Some(read_dict(data)),
-	_ => Some(Err("Unable to continue parsing")),
+	"0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => parse_bytestring(data),
+	"i" => parse_integer(data),
+	"l" => parse_list(data),
+	"d" => parse_dict(data),
+	_ => ParseResult::Err("Unable to continue parsing: can't determine where to dispatch"),
     }
 }
 
-fn parse(data: &str) -> Result<Vec<Element>, &'static str> {
+fn parse(data: &str) -> ParsedDocument {
     let mut offset = 0;
     let mut ret: Vec<Element> = Vec::new();
 
-    while let Some(result) = dispatch(&data[offset..]) {
-	match result {
-	    Ok(result) => {
+    while offset < data.len() {
+	match dispatch(&data[offset..]) {
+	    ParseResult::Ok(result) => {
 		ret.push(result.element);
 		offset += result.end_offset;
 	    },
 
-	    Err(e) => return Err(e)
+	    ParseResult::Err(e) => return ParsedDocument::Err(e),
+
+	    ParseResult::None => return ParsedDocument::Err("Unexpected end of input"), // make a test that can cause this state...
 	}
     }
 
-    return Ok(ret);
+    return ParsedDocument::Ok(ret);
 }
 
 #[cfg(test)]
@@ -185,187 +191,225 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_string_happy_path() {
+    fn parse_string_happy_path() {
 	let input = "0:";
-	let result = read_bytestring(input).unwrap();
-	assert_eq!(result.element, Element::ByteString("".to_string()));
-	assert_eq!(&input[result.end_offset..], "");
+	let result = parse_bytestring(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::ByteString("".to_string()),
+	    end_offset: input.len(),
+	}));
 
 	let input = "8:announce";
-	let result = read_bytestring(input).unwrap();
-	assert_eq!(result.element, Element::ByteString("announce".to_string()));
-	assert_eq!(&input[result.end_offset..], "");
+	let result = parse_bytestring(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::ByteString("announce".to_string()),
+	    end_offset: input.len(),
+	}));
 
 	let input = "41:http://bttracker.debian.org:6969/announce";
-	let result = read_bytestring(input).unwrap();
-	assert_eq!(result.element, Element::ByteString("http://bttracker.debian.org:6969/announce".to_string()));
-	assert_eq!(&input[result.end_offset..], "");
+	let result = parse_bytestring(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::ByteString("http://bttracker.debian.org:6969/announce".to_string()),
+	    end_offset: input.len(),
+	}));
 
 	let input = "8:announce41:http://bttracker.debian.org:6969/announce7:comment";
-	let result = read_bytestring(input).unwrap();
-	assert_eq!(result.element, Element::ByteString("announce".to_string()));
-	assert_eq!(&input[result.end_offset..], "41:http://bttracker.debian.org:6969/announce7:comment");
+	let result = parse_bytestring(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::ByteString("announce".to_string()),
+	    end_offset: input.len() - "41:http://bttracker.debian.org:6969/announce7:comment".len(),
+	}));
     }
 
     #[test]
-    fn read_string_missing_colon() {
+    fn parse_string_missing_colon() {
 	// TODO! How to assert return type?
     }
 
     #[test]
-    fn read_string_fail_to_parse_size() {
+    fn parse_string_fail_to_parse_size() {
 	// TODO!
     }
 
     #[test]
-    fn read_integer_happy_path() {
+    fn parse_integer_happy_path() {
 	let input = "i10e";
-	let result = read_integer(input).unwrap();
-	assert_eq!(result.element, Element::Integer(10));
-	assert_eq!(&input[result.end_offset..], "");
+	let result = parse_integer(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::Integer(10),
+	    end_offset: input.len(),
+	}));
 
 	let input = "i-10e";
-	let result = read_integer(input).unwrap();
-	assert_eq!(result.element, Element::Integer(-10));
-	assert_eq!(&input[result.end_offset..], "");
+	let result = parse_integer(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::Integer(-10),
+	    end_offset: input.len(),
+	}));
     }
 
     #[test]
-    fn read_integer_missing_leading_i() {
+    fn parse_integer_missing_leading_i() {
     }
 
     #[test]
-    fn read_integer_fail_to_parse_int() {
+    fn parse_integer_fail_to_parse_int() {
     }
 
     #[test]
-    fn read_integer_missing_ending_e() {
+    fn parse_integer_missing_ending_e() {
     }
 
     #[test]
-    fn read_list_happy_path() {
+    fn parse_list_happy_path() {
 	let input = "le";
-	let result = read_list(input).unwrap();
+	let result = parse_list(input);
 	assert_eq!(
-	    result.element,
-	    Element::List(vec![])
+	    result,
+	    ParseResult::Ok(ElementParsed{
+		element: Element::List(vec![]),
+		end_offset: input.len(),
+	    })
 	);
-	assert_eq!(&input[result.end_offset..], "");
 
 	let input = "li10ei1ee";
-	let result = read_list(input).unwrap();
+	let result = parse_list(input);
 	assert_eq!(
-	    result.element,
-	    Element::List(vec![
-		Element::Integer(10),
-		Element::Integer(1)
-	    ])
+	    result,
+	    ParseResult::Ok(ElementParsed{
+		element: Element::List(vec![
+		    Element::Integer(10),
+		    Element::Integer(1)
+		]),
+		end_offset: input.len(),
+	    })
 	);
-	assert_eq!(&input[result.end_offset..], "");
 
 	let input = "li10ei1ee1:a";
-	let result = read_list(input).unwrap();
+	let result = parse_list(input);
 	assert_eq!(
-	    result.element,
-	    Element::List(vec![
-		Element::Integer(10),
-		Element::Integer(1)
-	    ])
+	    result,
+	    ParseResult::Ok(ElementParsed{
+		element: Element::List(vec![
+		    Element::Integer(10),
+		    Element::Integer(1)
+		]),
+		end_offset: input.len() - "1:a".len()
+	    })
 	);
-	assert_eq!(&input[result.end_offset..], "1:a");
 
 	let input = "li10ei1el1:bee1:a";
-	let result = read_list(input).unwrap();
+	let result = parse_list(input);
 	assert_eq!(
-	    result.element,
-	    Element::List(vec![
-		Element::Integer(10),
-		Element::Integer(1),
-		Element::List(vec![
-		    Element::ByteString("b".to_string()),
+	    result,
+	    ParseResult::Ok(ElementParsed{
+		element: Element::List(vec![
+		    Element::Integer(10),
+		    Element::Integer(1),
+		    Element::List(vec![
+			Element::ByteString("b".to_string()),
+		    ]),
 		]),
-	    ])
+		end_offset: input.len() - "1:a".len(),
+	    })
 	);
-	assert_eq!(&input[result.end_offset..], "1:a");
     }
 
     #[test]
-    fn read_dict_happy_path() {
+    fn parse_dict_happy_path() {
 	let input = "de";
-	let result = read_dict(input).unwrap();
+	let result = parse_dict(input);
 	assert_eq!(
-	    result.element,
-	    Element::Dict(vec![])
+	    result,
+	    ParseResult::Ok(ElementParsed{
+		element: Element::Dict(vec![]),
+		end_offset: input.len(),
+	    })
 	);
-	assert_eq!(&input[result.end_offset..], "");
 
 	let input = "d1:ai10ee";
-	let result = read_dict(input).unwrap();
+	let result = parse_dict(input);
 	assert_eq!(
-	    result.element,
-	    Element::Dict(vec![
-		("a".to_string(), Box::new(Element::Integer(10)))
-	    ])
+	    result,
+	    ParseResult::Ok(ElementParsed{
+		element: Element::Dict(vec![
+		    ("a".to_string(), Box::new(Element::Integer(10)))
+		]),
+		end_offset: input.len(),
+	    })
 	);
-	assert_eq!(&input[result.end_offset..], "");
 
 	let input = "d4:listli10ei1el1:beee1:a";
-	let result = read_dict(input).unwrap();
+	let result = parse_dict(input);
 	assert_eq!(
-	    result.element,
-	    Element::Dict(vec![
-		(
-		    "list".to_string(),
-		    Box::new(
-			Element::List(vec![
-			    Element::Integer(10),
-			    Element::Integer(1),
+	    result,
+	    ParseResult::Ok(ElementParsed{
+		element: Element::Dict(vec![
+		    (
+			"list".to_string(),
+			Box::new(
 			    Element::List(vec![
-				Element::ByteString("b".to_string()),
-			    ]),
-			])
-		    )
-		),
-	    ])
+				Element::Integer(10),
+				Element::Integer(1),
+				Element::List(vec![
+				    Element::ByteString("b".to_string()),
+				]),
+			    ])
+			)
+		    ),
+		]),
+		end_offset: input.len() - "1:a".len(),
+	    })
 	);
-	assert_eq!(&input[result.end_offset..], "1:a");
     }
     
     #[test]
     fn dispatch_happy_path() {
-	let result: ReadResult = dispatch("8:announce").unwrap().unwrap();
-	assert!(matches!(result.element, Element::ByteString{ .. }));
+	let input = "8:announce";
+	let result: ParseResult = dispatch(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::ByteString("announce".to_string()),
+	    end_offset: input.len(),
+	}));
 
-	let result: ReadResult = dispatch("i-18e").unwrap().unwrap();
-	assert!(matches!(result.element, Element::Integer{ .. }));
+	let input = "i-18e";
+	let result: ParseResult = dispatch(input);
+	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	    element: Element::Integer(-18),
+	    end_offset: input.len(),
+	}));
     }
 
     #[test]
     fn parse_happy_path() {
-	let result: &Element = &parse("8:announce").unwrap()[0];
-	assert_eq!(result, &Element::ByteString("announce".to_string()));
-
-	let result: &Element = &parse("i-18e").unwrap()[0];
-	assert_eq!(result, &Element::Integer(-18));
-
-	let result: Vec<Element> = parse(
-	    "8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by"
-	).unwrap();
 	assert_eq!(
-	    result,
-	    vec![
+	    parse("8:announce"),
+	    ParsedDocument::Ok(vec![
+		Element::ByteString("announce".to_string())
+	    ])
+	);
+
+	assert_eq!(
+	    parse("i-18e"),
+	    ParsedDocument::Ok(vec![
+		Element::Integer(-18)
+	    ])
+	);
+
+	assert_eq!(
+	    parse("8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by"),
+	    ParsedDocument::Ok(vec![
 		Element::ByteString("announce".to_string()),
 		Element::ByteString("http://bttracker.debian.org:6969/announce".to_string()),
 		Element::ByteString("comment".to_string()),
 		Element::ByteString("\"Debian CD from cdimage.debian.org\"".to_string()),
 		Element::ByteString("created by".to_string()),
-	    ]
+	    ])
 	);
 
-	let result: Vec<Element> = parse("li10ei1el1:bee1:a").unwrap();
 	assert_eq!(
-	    result,
-	    vec![
+	    parse("li10ei1el1:bee1:a"),
+	    ParsedDocument::Ok(vec![
 		Element::List(vec![
 		    Element::Integer(10),
 		    Element::Integer(1),
@@ -374,7 +418,7 @@ mod tests {
 		    ]),
 		]),
 		Element::ByteString("a".to_string()),
-	    ]
+	    ])
 	);
     }
 }
