@@ -1,10 +1,17 @@
 #[derive(Debug)]
 #[derive(PartialEq)]
-enum Element {
+pub struct DictEntry {
+    key: String,
+    value: Element,
+}
+
+#[derive(Debug)]
+#[derive(PartialEq)]
+pub enum Element {
     ByteString(String),
     Integer(i64),
     List(Vec<Element>),
-    Dict(Vec<(String, Box<Element>)>), // what is box doing here?
+    Dict(Vec<DictEntry>),
 }
 
 #[derive(Debug)]
@@ -24,7 +31,7 @@ enum ParseResult {
 
 #[derive(Debug)]
 #[derive(PartialEq)]
-enum ParsedDocument {
+pub enum ParsedDocument {
     Ok(Vec<Element>),
     Err(&'static str),
 }
@@ -109,7 +116,7 @@ fn parse_list(data: &str) -> ParseResult {
 
 fn parse_dict(data: &str) -> ParseResult {
     let mut offset = 0;
-    let mut ret: Vec<(String, Box<Element>)> = Vec::new();
+    let mut ret: Vec<DictEntry> = Vec::new();
 
     if &data[0..1] != "d" {
 	return ParseResult::Err("Can't parse list: missing leading 'd'");
@@ -127,9 +134,9 @@ fn parse_dict(data: &str) -> ParseResult {
 		    ParseResult::Ok(parse_key) => {
 			match parse_key.element {
 			    Element::ByteString(key) => {
-				match dispatch(&data[parse_key.end_offset+1..]) {
+				match dispatch(&data[offset+parse_key.end_offset..]) {
 				    ParseResult::Ok(result) => {
-					ret.push((key, Box::new(result.element)));
+					ret.push(DictEntry{ key: key, value: result.element });
 					offset += result.end_offset + parse_key.end_offset
 				    },
 
@@ -166,7 +173,7 @@ fn dispatch(data: &str) -> ParseResult {
     }
 }
 
-fn parse(data: &str) -> ParsedDocument {
+pub fn parse(data: &str) -> ParsedDocument {
     let mut offset = 0;
     let mut ret: Vec<Element> = Vec::new();
 
@@ -333,7 +340,7 @@ mod tests {
 	    result,
 	    ParseResult::Ok(ElementParsed{
 		element: Element::Dict(vec![
-		    ("a".to_string(), Box::new(Element::Integer(10)))
+		    DictEntry{ key: "a".to_string(), value: Element::Integer(10) }
 		]),
 		end_offset: input.len(),
 	    })
@@ -345,18 +352,16 @@ mod tests {
 	    result,
 	    ParseResult::Ok(ElementParsed{
 		element: Element::Dict(vec![
-		    (
-			"list".to_string(),
-			Box::new(
+		    DictEntry{
+			key: "list".to_string(),
+			value: Element::List(vec![
+			    Element::Integer(10),
+			    Element::Integer(1),
 			    Element::List(vec![
-				Element::Integer(10),
-				Element::Integer(1),
-				Element::List(vec![
-				    Element::ByteString("b".to_string()),
-				]),
-			    ])
-			)
-		    ),
+				Element::ByteString("b".to_string()),
+			    ]),
+			])
+		    }
 		]),
 		end_offset: input.len() - "1:a".len(),
 	    })
@@ -418,6 +423,30 @@ mod tests {
 		    ]),
 		]),
 		Element::ByteString("a".to_string()),
+	    ])
+	);
+
+	assert_eq!(
+	    parse("d8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by13:mktorrent 1.113:creation datei1662813552ee"),
+	    ParsedDocument::Ok(vec![
+		Element::Dict(vec![
+		    DictEntry{
+			key: "announce".to_string(),
+			value: Element::ByteString("http://bttracker.debian.org:6969/announce".to_string())
+		    },
+		    DictEntry{
+			key: "comment".to_string(),
+			value: Element::ByteString("\"Debian CD from cdimage.debian.org\"".to_string())
+		    },
+		    DictEntry{
+			key: "created by".to_string(),
+			value: Element::ByteString("mktorrent 1.1".to_string())
+		    },
+		    DictEntry{
+			key: "creation date".to_string(),
+			value: Element::Integer(1662813552)
+		    },
+		]),
 	    ])
 	);
     }
