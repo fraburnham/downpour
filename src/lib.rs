@@ -114,6 +114,8 @@ fn read_dict(data: &str) -> Result<ReadResult, &'static str> {
 	    _ => {
 		// has to be possible to flatten this out...
 		// maybe re-use from parse?
+		// a type would probably help flatten out the matches, combine the Some and Ok
+		// into ReadResult? <Ok | Err | None>
 		match read_bytestring(&data[offset..]) {
 		    Ok(read_key) => {
 			match read_key.element {
