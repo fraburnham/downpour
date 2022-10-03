@@ -1,14 +1,15 @@
 #[derive(Debug)]
 #[derive(PartialEq)]
 pub struct DictEntry {
-    key: String,
+    key: Vec<u8>,
     value: Element,
 }
 
 #[derive(Debug)]
 #[derive(PartialEq)]
 pub enum Element {
-    ByteString(String),
+    // lifecycles could make using a &[u8] possible here
+    ByteString(Vec<u8>), // ascii or byte
     Integer(i64),
     List(Vec<Element>),
     Dict(Vec<DictEntry>),
@@ -36,14 +37,56 @@ pub enum ParsedDocument {
     Err(&'static str),
 }
 
-fn parse_bytestring(data: &str) -> ParseResult {
-    match data.find(":") {
+const COLON: &u8 = &":".as_bytes()[0];
+const MINUS: &u8 = &"-".as_bytes()[0];
+const D: &u8 = &"d".as_bytes()[0];
+const E: &u8 = &"e".as_bytes()[0];
+const I: &u8 = &"i".as_bytes()[0];
+const L: &u8 = &"l".as_bytes()[0];
+
+fn parse_ascii_integer(data: &[u8]) -> Result<i64, &'static str> { // figure out how to let the caller specify the return type?
+    let mut negative = false;
+    let mut val: i64 = 0;
+    let mut iter = data.iter();
+
+    if let Some(n) = iter.next() {
+	if n == MINUS {
+	    // consume the byte
+	    negative = true;
+	} else {
+	    // reset the iterator
+	    iter = data.iter();
+	}
+    }
+
+    // there is a failure case when there is nothing to parse, but this doesn't account for only having a `-`...
+    if data.len() == 0 {
+	return Err("Nothing to parse");
+    }
+
+    for (index, n) in iter.rev().enumerate() {
+	// guard for index greater than u32?
+	// more general guard against integer overflow?
+	val += ((n - 0x30) as i64) * 10i64.pow(index.try_into().unwrap());
+    }
+
+    if negative {
+	val = -val;
+    }
+    
+    return Ok(val);
+}
+
+fn parse_bytestring(data: &[u8]) -> ParseResult {
+    // wtf is this position syntax?
+    match data.iter().position(|d_var| d_var == COLON) {
 	Some(size_end) => {
-	    match data[0..size_end].parse::<usize>() {
+	    match parse_ascii_integer(&data[0..size_end]) {
 		Ok(length) => {
-		    let parse_start = size_end + 1;
-		    let parse_end = parse_start + length;
-		    let element = data[parse_start..parse_end].to_string();
+		    let parse_start: usize = size_end + 1;
+		    let parse_end: usize = parse_start + (length as usize);
+		    let mut element: Vec<u8> = Vec::new();
+		    element.extend_from_slice(&data[parse_start..parse_end]);
 
 		    ParseResult::Ok(ElementParsed{
 			element: Element::ByteString(element),
@@ -58,14 +101,14 @@ fn parse_bytestring(data: &str) -> ParseResult {
     }
 }
 
-fn parse_integer(data: &str) -> ParseResult {
-    if &data[0..1] != "i" { // this looks stupid it can't be right...
+fn parse_integer(data: &[u8]) -> ParseResult {
+    if &data[0] != I { // this looks stupid it can't be right...
 	return ParseResult::Err("Can't parse integer: missing leading 'i'");
     }
 
-    match data.find("e") {
+    match data.iter().position(|d_var| d_var == E) {
 	Some(integer_end) => {
-	    match data[1..integer_end].parse::<i64>() {
+	    match parse_ascii_integer(&data[1..integer_end]) {
 		Ok(element) => {
 		    ParseResult::Ok(ElementParsed{
 			element: Element::Integer(element),
@@ -81,18 +124,18 @@ fn parse_integer(data: &str) -> ParseResult {
     }
 }
 
-fn parse_list(data: &str) -> ParseResult {
+fn parse_list(data: &[u8]) -> ParseResult {
     let mut offset = 0;
     let mut ret: Vec<Element> = Vec::new();
 
-    if &data[0..1] != "l" {
+    if &data[0] != L {
 	return ParseResult::Err("Can't parse list: missing leading 'l'");
     }
     offset += 1; // trim leading l
 
     while offset < data.len() {
-	match &data[offset..offset+1] {
-	    "e" => return ParseResult::Ok(ElementParsed{ 
+	match &data[offset] { // if I use a byte array this can be array index?
+	    E => return ParseResult::Ok(ElementParsed{ 
 		element: Element::List(ret),
 		end_offset: offset + 1, // trim trailling 'e'
 	    }), 
@@ -114,18 +157,18 @@ fn parse_list(data: &str) -> ParseResult {
     return ParseResult::Err("Can't parse list: ran out of chars before trailing 'e'");
 }
 
-fn parse_dict(data: &str) -> ParseResult {
+fn parse_dict(data: &[u8]) -> ParseResult {
     let mut offset = 0;
     let mut ret: Vec<DictEntry> = Vec::new();
 
-    if &data[0..1] != "d" {
+    if &data[0] != D {
 	return ParseResult::Err("Can't parse list: missing leading 'd'");
     }
     offset += 1;
 
     while offset < data.len() {
-	match &data[offset..offset+1] {
-	    "e" => return ParseResult::Ok(ElementParsed{
+	match &data[offset] {
+	    E => return ParseResult::Ok(ElementParsed{
 		element: Element::Dict(ret),
 		end_offset: offset + 1, // trim trailing 'e'
 	    }),
@@ -136,6 +179,7 @@ fn parse_dict(data: &str) -> ParseResult {
 			    Element::ByteString(key) => {
 				match dispatch(&data[offset+parse_key.end_offset..]) {
 				    ParseResult::Ok(result) => {
+					// need to convert the bytestring to a real string
 					ret.push(DictEntry{ key: key, value: result.element });
 					offset += result.end_offset + parse_key.end_offset
 				    },
@@ -159,21 +203,21 @@ fn parse_dict(data: &str) -> ParseResult {
     return ParseResult::Err("Can't parse dict: ran out of chars");
 }
 
-fn dispatch(data: &str) -> ParseResult {
+fn dispatch(data: &[u8]) -> ParseResult {
     if data.len() <= 0 {
 	return ParseResult::None;
     }
 
-    match &data[0..1] {
-	"0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => parse_bytestring(data),
-	"i" => parse_integer(data),
-	"l" => parse_list(data),
-	"d" => parse_dict(data),
+    match &data[0] {
+	0x30 ..= 0x39 => parse_bytestring(data),
+	I => parse_integer(data),
+	L => parse_list(data),
+	D => parse_dict(data),
 	_ => ParseResult::Err("Unable to continue parsing: can't determine where to dispatch"),
     }
 }
 
-pub fn parse(data: &str) -> ParsedDocument {
+pub fn parse(data: &[u8]) -> ParsedDocument {
     let mut offset = 0;
     let mut ret: Vec<Element> = Vec::new();
 
@@ -198,32 +242,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_ascii_integer_happy_path() {
+	assert_eq!(parse_ascii_integer("-134".as_bytes()).unwrap(), -134);
+	assert_eq!(parse_ascii_integer("134".as_bytes()).unwrap(), 134);
+	assert_eq!(parse_ascii_integer("0".as_bytes()).unwrap(), 0);
+	assert_eq!(parse_ascii_integer("12345678".as_bytes()).unwrap(), 12345678);
+	assert_eq!(parse_ascii_integer("-12345678".as_bytes()).unwrap(), -12345678);
+    }
+    
+    #[test]
     fn parse_string_happy_path() {
-	let input = "0:";
+	let input = "0:".as_bytes();
 	let result = parse_bytestring(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
-	    element: Element::ByteString("".to_string()),
+	    element: Element::ByteString(vec![]),
 	    end_offset: input.len(),
 	}));
 
-	let input = "8:announce";
+	let input = "8:announce".as_bytes();
 	let result = parse_bytestring(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
-	    element: Element::ByteString("announce".to_string()),
+	    element: Element::ByteString("announce".as_bytes().to_vec()),
 	    end_offset: input.len(),
 	}));
 
-	let input = "41:http://bttracker.debian.org:6969/announce";
+	let input = "41:http://bttracker.debian.org:6969/announce".as_bytes();
 	let result = parse_bytestring(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
-	    element: Element::ByteString("http://bttracker.debian.org:6969/announce".to_string()),
+	    element: Element::ByteString("http://bttracker.debian.org:6969/announce".as_bytes().to_vec()),
 	    end_offset: input.len(),
 	}));
 
-	let input = "8:announce41:http://bttracker.debian.org:6969/announce7:comment";
+	let input = "8:announce41:http://bttracker.debian.org:6969/announce7:comment".as_bytes();
 	let result = parse_bytestring(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
-	    element: Element::ByteString("announce".to_string()),
+	    element: Element::ByteString("announce".as_bytes().to_vec()),
 	    end_offset: input.len() - "41:http://bttracker.debian.org:6969/announce7:comment".len(),
 	}));
     }
@@ -240,14 +293,14 @@ mod tests {
 
     #[test]
     fn parse_integer_happy_path() {
-	let input = "i10e";
+	let input = "i10e".as_bytes();
 	let result = parse_integer(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
 	    element: Element::Integer(10),
 	    end_offset: input.len(),
 	}));
 
-	let input = "i-10e";
+	let input = "i-10e".as_bytes();
 	let result = parse_integer(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
 	    element: Element::Integer(-10),
@@ -269,7 +322,7 @@ mod tests {
 
     #[test]
     fn parse_list_happy_path() {
-	let input = "le";
+	let input = "le".as_bytes();
 	let result = parse_list(input);
 	assert_eq!(
 	    result,
@@ -279,7 +332,7 @@ mod tests {
 	    })
 	);
 
-	let input = "li10ei1ee";
+	let input = "li10ei1ee".as_bytes();
 	let result = parse_list(input);
 	assert_eq!(
 	    result,
@@ -292,7 +345,7 @@ mod tests {
 	    })
 	);
 
-	let input = "li10ei1ee1:a";
+	let input = "li10ei1ee1:a".as_bytes();
 	let result = parse_list(input);
 	assert_eq!(
 	    result,
@@ -305,7 +358,7 @@ mod tests {
 	    })
 	);
 
-	let input = "li10ei1el1:bee1:a";
+	let input = "li10ei1el1:bee1:a".as_bytes();
 	let result = parse_list(input);
 	assert_eq!(
 	    result,
@@ -314,7 +367,7 @@ mod tests {
 		    Element::Integer(10),
 		    Element::Integer(1),
 		    Element::List(vec![
-			Element::ByteString("b".to_string()),
+			Element::ByteString("b".as_bytes().to_vec()),
 		    ]),
 		]),
 		end_offset: input.len() - "1:a".len(),
@@ -324,7 +377,7 @@ mod tests {
 
     #[test]
     fn parse_dict_happy_path() {
-	let input = "de";
+	let input = "de".as_bytes();
 	let result = parse_dict(input);
 	assert_eq!(
 	    result,
@@ -334,31 +387,31 @@ mod tests {
 	    })
 	);
 
-	let input = "d1:ai10ee";
+	let input = "d1:ai10ee".as_bytes();
 	let result = parse_dict(input);
 	assert_eq!(
 	    result,
 	    ParseResult::Ok(ElementParsed{
 		element: Element::Dict(vec![
-		    DictEntry{ key: "a".to_string(), value: Element::Integer(10) }
+		    DictEntry{ key: "a".as_bytes().to_vec(), value: Element::Integer(10) }
 		]),
 		end_offset: input.len(),
 	    })
 	);
 
-	let input = "d4:listli10ei1el1:beee1:a";
+	let input = "d4:listli10ei1el1:beee1:a".as_bytes();
 	let result = parse_dict(input);
 	assert_eq!(
 	    result,
 	    ParseResult::Ok(ElementParsed{
 		element: Element::Dict(vec![
 		    DictEntry{
-			key: "list".to_string(),
+			key: "list".as_bytes().to_vec(),
 			value: Element::List(vec![
 			    Element::Integer(10),
 			    Element::Integer(1),
 			    Element::List(vec![
-				Element::ByteString("b".to_string()),
+				Element::ByteString("b".as_bytes().to_vec()),
 			    ]),
 			])
 		    }
@@ -370,14 +423,14 @@ mod tests {
     
     #[test]
     fn dispatch_happy_path() {
-	let input = "8:announce";
+	let input = "8:announce".as_bytes();
 	let result: ParseResult = dispatch(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
-	    element: Element::ByteString("announce".to_string()),
+	    element: Element::ByteString("announce".as_bytes().to_vec()),
 	    end_offset: input.len(),
 	}));
 
-	let input = "i-18e";
+	let input = "i-18e".as_bytes();
 	let result: ParseResult = dispatch(input);
 	assert_eq!(result, ParseResult::Ok(ElementParsed{
 	    element: Element::Integer(-18),
@@ -388,62 +441,62 @@ mod tests {
     #[test]
     fn parse_happy_path() {
 	assert_eq!(
-	    parse("8:announce"),
+	    parse("8:announce".as_bytes()),
 	    ParsedDocument::Ok(vec![
-		Element::ByteString("announce".to_string())
+		Element::ByteString("announce".as_bytes().to_vec())
 	    ])
 	);
 
 	assert_eq!(
-	    parse("i-18e"),
+	    parse("i-18e".as_bytes()),
 	    ParsedDocument::Ok(vec![
 		Element::Integer(-18)
 	    ])
 	);
 
 	assert_eq!(
-	    parse("8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by"),
+	    parse("8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by".as_bytes()),
 	    ParsedDocument::Ok(vec![
-		Element::ByteString("announce".to_string()),
-		Element::ByteString("http://bttracker.debian.org:6969/announce".to_string()),
-		Element::ByteString("comment".to_string()),
-		Element::ByteString("\"Debian CD from cdimage.debian.org\"".to_string()),
-		Element::ByteString("created by".to_string()),
+		Element::ByteString("announce".as_bytes().to_vec()),
+		Element::ByteString("http://bttracker.debian.org:6969/announce".as_bytes().to_vec()),
+		Element::ByteString("comment".as_bytes().to_vec()),
+		Element::ByteString("\"Debian CD from cdimage.debian.org\"".as_bytes().to_vec()),
+		Element::ByteString("created by".as_bytes().to_vec()),
 	    ])
 	);
 
 	assert_eq!(
-	    parse("li10ei1el1:bee1:a"),
+	    parse("li10ei1el1:bee1:a".as_bytes()),
 	    ParsedDocument::Ok(vec![
 		Element::List(vec![
 		    Element::Integer(10),
 		    Element::Integer(1),
 		    Element::List(vec![
-			Element::ByteString("b".to_string()),
+			Element::ByteString("b".as_bytes().to_vec()),
 		    ]),
 		]),
-		Element::ByteString("a".to_string()),
+		Element::ByteString("a".as_bytes().to_vec()),
 	    ])
 	);
 
 	assert_eq!(
-	    parse("d8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by13:mktorrent 1.113:creation datei1662813552ee"),
+	    parse("d8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by13:mktorrent 1.113:creation datei1662813552ee".as_bytes()),
 	    ParsedDocument::Ok(vec![
 		Element::Dict(vec![
 		    DictEntry{
-			key: "announce".to_string(),
-			value: Element::ByteString("http://bttracker.debian.org:6969/announce".to_string())
+			key: "announce".as_bytes().to_vec(),
+			value: Element::ByteString("http://bttracker.debian.org:6969/announce".as_bytes().to_vec())
 		    },
 		    DictEntry{
-			key: "comment".to_string(),
-			value: Element::ByteString("\"Debian CD from cdimage.debian.org\"".to_string())
+			key: "comment".as_bytes().to_vec(),
+			value: Element::ByteString("\"Debian CD from cdimage.debian.org\"".as_bytes().to_vec())
 		    },
 		    DictEntry{
-			key: "created by".to_string(),
-			value: Element::ByteString("mktorrent 1.1".to_string())
+			key: "created by".as_bytes().to_vec(),
+			value: Element::ByteString("mktorrent 1.1".as_bytes().to_vec())
 		    },
 		    DictEntry{
-			key: "creation date".to_string(),
+			key: "creation date".as_bytes().to_vec(),
 			value: Element::Integer(1662813552)
 		    },
 		]),
