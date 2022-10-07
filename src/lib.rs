@@ -1,3 +1,27 @@
+use base64;
+
+#[derive(Debug)]
+#[derive(PartialEq)]
+pub enum DecodeErrorType {
+    DispatchFailed,
+    InvalidByteStringSize,
+    InvalidByteStringData,
+    InvalidDictKey,
+    InvalidIntegerValue,
+    MissingDelimiter, // :
+    MissingEndDelimiter, // e
+    MissingStartDelimiter, // l,d,i
+    NothingToDecode,
+}
+
+#[derive(Debug)]
+#[derive(PartialEq)]
+pub struct DecodeError {
+    offset: usize, // each error catcher needs to adjust the offset based on the relative value they see
+    msg: &'static str,
+    error_type: DecodeErrorType,
+}
+
 #[derive(Debug)]
 #[derive(PartialEq)]
 pub struct DictEntry {
@@ -17,34 +41,106 @@ pub enum Element {
 
 #[derive(Debug)]
 #[derive(PartialEq)]
-struct ElementParsed {
+struct ElementDecoded {
     element: Element,
     end_offset: usize,
 }
 
 #[derive(Debug)]
 #[derive(PartialEq)]
-enum ParseResult {
-    Ok(ElementParsed),
-    Err(&'static str), // TODO: make errors types and attach more useful info to them
-    None,
+enum DecodeResult {
+    Ok(ElementDecoded),
+    Err(DecodeError)
 }
 
 #[derive(Debug)]
 #[derive(PartialEq)]
-pub enum ParsedDocument {
+pub enum DecodedDocument {
     Ok(Vec<Element>),
-    Err(&'static str),
+    Err(DecodeError),
 }
 
-const COLON: &u8 = &":".as_bytes()[0];
-const MINUS: &u8 = &"-".as_bytes()[0];
-const D: &u8 = &"d".as_bytes()[0];
-const E: &u8 = &"e".as_bytes()[0];
-const I: &u8 = &"i".as_bytes()[0];
-const L: &u8 = &"l".as_bytes()[0];
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+	write!(f, "ERROR! offset: {}, error type: {:?}\nmessage:\n{}", self.offset, self.error_type, self.msg)
+    }
+}
 
-fn parse_ascii_integer(data: &[u8]) -> Result<i64, &'static str> { // figure out how to let the caller specify the return type?
+impl std::fmt::Display for DictEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+	// dict keys are printable ascii or an error
+	write!(f, "\"{}\": {}", String::from_utf8(self.key.to_vec()).unwrap(), self.value)
+    }
+}
+
+impl std::fmt::Display for Element {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+	match self {
+	    Element::ByteString(s) => {
+		write!(f, "\"{}\"",
+		       match String::from_utf8(s.to_vec()) {
+			   Ok(s) => s.replace("\"", "\\\""),
+			   Err(_) => format!("{}", base64::encode(s)),
+		       }
+		)
+	    },
+	    Element::Integer(i) => write!(f, "{}", i),
+	    Element::List(list) => {
+		// TODO: De-dup! Is this a macro?
+		let mut formatted = String::new();
+
+		formatted.push('[');
+		for entry in list {
+		    formatted.push_str(format!("{}, ", entry).as_str()); // is this cast dumb?
+		}
+		formatted.pop(); formatted.pop(); // remove trailing `, `
+		formatted.push(']');
+
+		write!(f, "{}", formatted)
+	    },
+	    Element::Dict(dict) => {
+		let mut formatted = String::new();
+
+		formatted.push('{');
+		for entry in dict {
+		    formatted.push_str(format!("{}, ", entry).as_str()); // is this cast dumb?
+		}
+		formatted.pop(); formatted.pop(); // remove trailing `, `
+		formatted.push('}');
+
+		write!(f, "{}", formatted)
+	    },
+	}
+    }
+}
+
+impl std::fmt::Display for DecodedDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+	match self {
+	    DecodedDocument::Ok(elements) => {
+		let mut res: std::fmt::Result = write!(f, "");
+		
+		for el in elements {
+		    res = write!(f, "{}", el);
+		}
+
+		res
+	    },
+	    DecodedDocument::Err(e) => {
+		write!(f, "{}", e)
+	    }
+	}
+    }
+}
+
+const COLON: &u8 = &b':';
+const MINUS: &u8 = &b'-';
+const D: &u8 = &b'd';
+const E: &u8 = &b'e';
+const I: &u8 = &b'i';
+const L: &u8 = &b'l';
+
+fn decode_ascii_integer(data: &[u8]) -> Result<i64, DecodeError> {
     let mut negative = false;
     let mut val: i64 = 0;
     let mut iter = data.iter();
@@ -59,9 +155,13 @@ fn parse_ascii_integer(data: &[u8]) -> Result<i64, &'static str> { // figure out
 	}
     }
 
-    // there is a failure case when there is nothing to parse, but this doesn't account for only having a `-`...
+    // there is a failure case when there is nothing to decode, but this doesn't account for only having a `-`...
     if data.len() == 0 {
-	return Err("Nothing to parse");
+	return Err(DecodeError{
+	    msg: "Nothing to decode",
+	    offset: 0,
+	    error_type: DecodeErrorType::NothingToDecode,
+	});
     }
 
     for (index, n) in iter.rev().enumerate() {
@@ -77,164 +177,215 @@ fn parse_ascii_integer(data: &[u8]) -> Result<i64, &'static str> { // figure out
     return Ok(val);
 }
 
-fn parse_bytestring(data: &[u8]) -> ParseResult {
+fn decode_bytestring(data: &[u8]) -> DecodeResult {
     // wtf is this position syntax?
     match data.iter().position(|d_var| d_var == COLON) {
 	Some(size_end) => {
-	    match parse_ascii_integer(&data[0..size_end]) {
+	    match decode_ascii_integer(&data[0..size_end]) {
 		Ok(length) => {
-		    let parse_start: usize = size_end + 1;
-		    let parse_end: usize = parse_start + (length as usize);
+		    let decode_start: usize = size_end + 1;
+		    let decode_end: usize = decode_start + (length as usize);
 		    let mut element: Vec<u8> = Vec::new();
-		    element.extend_from_slice(&data[parse_start..parse_end]);
+		    element.extend_from_slice(&data[decode_start..decode_end]);
 
-		    ParseResult::Ok(ElementParsed{
+		    DecodeResult::Ok(ElementDecoded{
 			element: Element::ByteString(element),
-			end_offset: parse_end,
+			end_offset: decode_end,
 		    })
 		},
 
-		Err(_) => ParseResult::Err("Can't parse size integer for string"),
+		Err(e) => DecodeResult::Err(DecodeError{
+		    msg: "Can't decode size integer for string",
+		    offset: e.offset,
+		    error_type: DecodeErrorType::InvalidByteStringSize,
+		}),
 	    }
 	},
-	None => ParseResult::Err("Can't parse bytestring from data: missing ':'"),
+	None => DecodeResult::Err(DecodeError{
+	    msg: "Can't decode bytestring from data: missing ':'",
+	    offset: 0,
+	    error_type: DecodeErrorType::MissingDelimiter,
+	}),
     }
 }
 
-fn parse_integer(data: &[u8]) -> ParseResult {
-    if &data[0] != I { // this looks stupid it can't be right...
-	return ParseResult::Err("Can't parse integer: missing leading 'i'");
+fn decode_integer(data: &[u8]) -> DecodeResult {
+    if &data[0] != I {
+	return DecodeResult::Err(DecodeError{
+	    msg: "Can't decode integer: missing leading 'i'",
+	    offset: 0,
+	    error_type: DecodeErrorType::MissingStartDelimiter,
+	});
     }
 
     match data.iter().position(|d_var| d_var == E) {
 	Some(integer_end) => {
-	    match parse_ascii_integer(&data[1..integer_end]) {
+	    match decode_ascii_integer(&data[1..integer_end]) {
 		Ok(element) => {
-		    ParseResult::Ok(ElementParsed{
+		    DecodeResult::Ok(ElementDecoded{
 			element: Element::Integer(element),
 			end_offset: integer_end + 1,
 		    })
 		},
 
-		Err(_) => ParseResult::Err("Can't parse integer")
+		Err(_) => DecodeResult::Err(DecodeError{
+		    msg: "Can't decode integer",
+		    offset: 0,
+		    error_type: DecodeErrorType::InvalidIntegerValue,
+		})
 	    }
 	},
 	    
-	None => ParseResult::Err("Can't parse integer: missing end 'e'"),
+	None => DecodeResult::Err(DecodeError{
+	    msg: "Can't decode integer: missing end 'e'",
+	    offset: 0,
+	    error_type: DecodeErrorType::MissingEndDelimiter,
+	}),
     }
 }
 
-fn parse_list(data: &[u8]) -> ParseResult {
+fn decode_list(data: &[u8]) -> DecodeResult {
     let mut offset = 0;
     let mut ret: Vec<Element> = Vec::new();
 
     if &data[0] != L {
-	return ParseResult::Err("Can't parse list: missing leading 'l'");
+	return DecodeResult::Err(DecodeError{
+	    msg: "Can't decode list: missing leading 'l'",
+	    offset: offset,
+	    error_type: DecodeErrorType::MissingStartDelimiter,
+	});
     }
     offset += 1; // trim leading l
 
     while offset < data.len() {
-	match &data[offset] { // if I use a byte array this can be array index?
-	    E => return ParseResult::Ok(ElementParsed{ 
+	match &data[offset] {
+	    E => return DecodeResult::Ok(ElementDecoded{ 
 		element: Element::List(ret),
 		end_offset: offset + 1, // trim trailling 'e'
 	    }), 
 	    _ => {
 		match dispatch(&data[offset..]) {
-		    ParseResult::Ok(result) => {
+		    DecodeResult::Ok(result) => {
 			ret.push(result.element);
 			offset += result.end_offset;
 		    },
 
-		    ParseResult::Err(e) => return ParseResult::Err(e),
-		
-		    ParseResult::None => return ParseResult::Err("Can't parse list: dispatch parse 'None'"),
+		    DecodeResult::Err(e) => return DecodeResult::Err(DecodeError{
+			msg: e.msg,
+			offset: e.offset + offset,
+			error_type: e.error_type,
+		    }),
 		}
 	    },
 	}
     }
 
-    return ParseResult::Err("Can't parse list: ran out of chars before trailing 'e'");
+    return DecodeResult::Err(DecodeError{
+	msg: "Can't decode list: ran out of chars before trailing 'e'",
+	offset: offset,
+	error_type: DecodeErrorType::MissingEndDelimiter,
+    });
 }
 
-fn parse_dict(data: &[u8]) -> ParseResult {
+fn decode_dict(data: &[u8]) -> DecodeResult {
     let mut offset = 0;
     let mut ret: Vec<DictEntry> = Vec::new();
 
     if &data[0] != D {
-	return ParseResult::Err("Can't parse list: missing leading 'd'");
+	return DecodeResult::Err(DecodeError{
+	    msg: "Can't decode list: missing leading 'd'",
+	    offset: offset,
+	    error_type: DecodeErrorType::MissingStartDelimiter,
+	});
     }
     offset += 1;
 
     while offset < data.len() {
 	match &data[offset] {
-	    E => return ParseResult::Ok(ElementParsed{
+	    E => return DecodeResult::Ok(ElementDecoded{
 		element: Element::Dict(ret),
 		end_offset: offset + 1, // trim trailing 'e'
 	    }),
 	    _ => {
-		match parse_bytestring(&data[offset..]) {
-		    ParseResult::Ok(parse_key) => {
-			match parse_key.element {
+		match decode_bytestring(&data[offset..]) {
+		    DecodeResult::Ok(decode_key) => {
+			match decode_key.element {
 			    Element::ByteString(key) => {
-				match dispatch(&data[offset+parse_key.end_offset..]) {
-				    ParseResult::Ok(result) => {
-					// need to convert the bytestring to a real string
+				match dispatch(&data[offset+decode_key.end_offset..]) {
+				    DecodeResult::Ok(result) => {
 					ret.push(DictEntry{ key: key, value: result.element });
-					offset += result.end_offset + parse_key.end_offset
+					offset += result.end_offset + decode_key.end_offset
 				    },
 
-				    ParseResult::Err(e) => return ParseResult::Err(e),
-
-				    ParseResult::None => return ParseResult::Err("Can't parse list: dispatch parse 'None'"),
+				    DecodeResult::Err(e) => return DecodeResult::Err(DecodeError{
+					msg: e.msg,
+					offset: e.offset + offset,
+					error_type: e.error_type,
+				    }),
 				}
 			    },
 
-			    _ => return ParseResult::Err("Can't parse dict key: got non bytestring element")
+			    _ => return DecodeResult::Err(DecodeError{
+				msg: "Can't decode dict key: got non bytestring element",
+				offset: offset,
+				error_type: DecodeErrorType::InvalidDictKey,
+			    })
 			}
 		    },
 
-		    _ => return ParseResult::Err("Can't parse dict key!")
+		    DecodeResult::Err(e) => {
+			return DecodeResult::Err(DecodeError{
+			    msg: e.msg,
+			    offset: e.offset + offset,
+			    error_type: e.error_type,
+			})
+		    },
 		}
 	    },
 	}
     }
 
-    return ParseResult::Err("Can't parse dict: ran out of chars");
+    return DecodeResult::Err(DecodeError{
+	msg: "Can't decode dict: ran out of chars",
+	offset: offset,
+	error_type: DecodeErrorType::MissingEndDelimiter,
+    });
 }
 
-fn dispatch(data: &[u8]) -> ParseResult {
-    if data.len() <= 0 {
-	return ParseResult::None;
-    }
-
+fn dispatch(data: &[u8]) -> DecodeResult {
     match &data[0] {
-	0x30 ..= 0x39 => parse_bytestring(data),
-	I => parse_integer(data),
-	L => parse_list(data),
-	D => parse_dict(data),
-	_ => ParseResult::Err("Unable to continue parsing: can't determine where to dispatch"),
+	0x30 ..= 0x39 => decode_bytestring(data), // 0 - 9 in ascii
+	I => decode_integer(data),
+	L => decode_list(data),
+	D => decode_dict(data),
+	_ => DecodeResult::Err(DecodeError{
+	    msg: "Unable to continue parsing: can't determine where to dispatch",
+	    offset: 0,
+	    error_type: DecodeErrorType::DispatchFailed,
+	}),
     }
 }
 
-pub fn parse(data: &[u8]) -> ParsedDocument {
+pub fn decode(data: &[u8]) -> DecodedDocument {
     let mut offset = 0;
     let mut ret: Vec<Element> = Vec::new();
 
     while offset < data.len() {
 	match dispatch(&data[offset..]) {
-	    ParseResult::Ok(result) => {
+	    DecodeResult::Ok(result) => {
 		ret.push(result.element);
 		offset += result.end_offset;
 	    },
 
-	    ParseResult::Err(e) => return ParsedDocument::Err(e),
-
-	    ParseResult::None => return ParsedDocument::Err("Unexpected end of input"), // make a test that can cause this state...
+	    DecodeResult::Err(e) => return DecodedDocument::Err(DecodeError{
+		msg: e.msg,
+		offset: e.offset + offset,
+		error_type: e.error_type,
+	    }),
 	}
     }
 
-    return ParsedDocument::Ok(ret);
+    return DecodedDocument::Ok(ret);
 }
 
 #[cfg(test)]
@@ -242,101 +393,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_ascii_integer_happy_path() {
-	assert_eq!(parse_ascii_integer("-134".as_bytes()).unwrap(), -134);
-	assert_eq!(parse_ascii_integer("134".as_bytes()).unwrap(), 134);
-	assert_eq!(parse_ascii_integer("0".as_bytes()).unwrap(), 0);
-	assert_eq!(parse_ascii_integer("12345678".as_bytes()).unwrap(), 12345678);
-	assert_eq!(parse_ascii_integer("-12345678".as_bytes()).unwrap(), -12345678);
+    fn decode_ascii_integer_happy_path() {
+	assert_eq!(decode_ascii_integer(b"-134").unwrap(), -134);
+	assert_eq!(decode_ascii_integer(b"134").unwrap(), 134);
+	assert_eq!(decode_ascii_integer(b"0").unwrap(), 0);
+	assert_eq!(decode_ascii_integer(b"12345678").unwrap(), 12345678);
+	assert_eq!(decode_ascii_integer(b"-12345678").unwrap(), -12345678);
     }
     
     #[test]
-    fn parse_string_happy_path() {
-	let input = "0:".as_bytes();
-	let result = parse_bytestring(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
+    fn decode_string_happy_path() {
+	let input = b"0:";
+	let result = decode_bytestring(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
 	    element: Element::ByteString(vec![]),
 	    end_offset: input.len(),
 	}));
 
-	let input = "8:announce".as_bytes();
-	let result = parse_bytestring(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	let input = b"8:announce";
+	let result = decode_bytestring(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
 	    element: Element::ByteString("announce".as_bytes().to_vec()),
 	    end_offset: input.len(),
 	}));
 
-	let input = "41:http://bttracker.debian.org:6969/announce".as_bytes();
-	let result = parse_bytestring(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	let input = b"41:http://bttracker.debian.org:6969/announce";
+	let result = decode_bytestring(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
 	    element: Element::ByteString("http://bttracker.debian.org:6969/announce".as_bytes().to_vec()),
 	    end_offset: input.len(),
 	}));
 
-	let input = "8:announce41:http://bttracker.debian.org:6969/announce7:comment".as_bytes();
-	let result = parse_bytestring(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	let input = b"8:announce41:http://bttracker.debian.org:6969/announce7:comment";
+	let result = decode_bytestring(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
 	    element: Element::ByteString("announce".as_bytes().to_vec()),
 	    end_offset: input.len() - "41:http://bttracker.debian.org:6969/announce7:comment".len(),
 	}));
     }
 
     #[test]
-    fn parse_string_missing_colon() {
-	// TODO! How to assert return type?
-    }
-
-    #[test]
-    fn parse_string_fail_to_parse_size() {
-	// TODO!
-    }
-
-    #[test]
-    fn parse_integer_happy_path() {
-	let input = "i10e".as_bytes();
-	let result = parse_integer(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
+    fn decode_integer_happy_path() {
+	let input = b"i10e";
+	let result = decode_integer(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
 	    element: Element::Integer(10),
 	    end_offset: input.len(),
 	}));
 
-	let input = "i-10e".as_bytes();
-	let result = parse_integer(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	let input = b"i-10e";
+	let result = decode_integer(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
 	    element: Element::Integer(-10),
 	    end_offset: input.len(),
 	}));
     }
 
     #[test]
-    fn parse_integer_missing_leading_i() {
-    }
-
-    #[test]
-    fn parse_integer_fail_to_parse_int() {
-    }
-
-    #[test]
-    fn parse_integer_missing_ending_e() {
-    }
-
-    #[test]
-    fn parse_list_happy_path() {
-	let input = "le".as_bytes();
-	let result = parse_list(input);
+    fn decode_list_happy_path() {
+	let input = b"le";
+	let result = decode_list(input);
 	assert_eq!(
 	    result,
-	    ParseResult::Ok(ElementParsed{
+	    DecodeResult::Ok(ElementDecoded{
 		element: Element::List(vec![]),
 		end_offset: input.len(),
 	    })
 	);
 
-	let input = "li10ei1ee".as_bytes();
-	let result = parse_list(input);
+	let input = b"li10ei1ee";
+	let result = decode_list(input);
 	assert_eq!(
 	    result,
-	    ParseResult::Ok(ElementParsed{
+	    DecodeResult::Ok(ElementDecoded{
 		element: Element::List(vec![
 		    Element::Integer(10),
 		    Element::Integer(1)
@@ -345,11 +474,11 @@ mod tests {
 	    })
 	);
 
-	let input = "li10ei1ee1:a".as_bytes();
-	let result = parse_list(input);
+	let input = b"li10ei1ee1:a";
+	let result = decode_list(input);
 	assert_eq!(
 	    result,
-	    ParseResult::Ok(ElementParsed{
+	    DecodeResult::Ok(ElementDecoded{
 		element: Element::List(vec![
 		    Element::Integer(10),
 		    Element::Integer(1)
@@ -358,16 +487,16 @@ mod tests {
 	    })
 	);
 
-	let input = "li10ei1el1:bee1:a".as_bytes();
-	let result = parse_list(input);
+	let input = b"li10ei1el1:bee1:a";
+	let result = decode_list(input);
 	assert_eq!(
 	    result,
-	    ParseResult::Ok(ElementParsed{
+	    DecodeResult::Ok(ElementDecoded{
 		element: Element::List(vec![
 		    Element::Integer(10),
 		    Element::Integer(1),
 		    Element::List(vec![
-			Element::ByteString("b".as_bytes().to_vec()),
+			Element::ByteString(b"b".to_vec()),
 		    ]),
 		]),
 		end_offset: input.len() - "1:a".len(),
@@ -376,42 +505,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_dict_happy_path() {
-	let input = "de".as_bytes();
-	let result = parse_dict(input);
+    fn decode_dict_happy_path() {
+	let input = b"de";
+	let result = decode_dict(input);
 	assert_eq!(
 	    result,
-	    ParseResult::Ok(ElementParsed{
+	    DecodeResult::Ok(ElementDecoded{
 		element: Element::Dict(vec![]),
 		end_offset: input.len(),
 	    })
 	);
 
-	let input = "d1:ai10ee".as_bytes();
-	let result = parse_dict(input);
+	let input = b"d1:ai10ee";
+	let result = decode_dict(input);
 	assert_eq!(
 	    result,
-	    ParseResult::Ok(ElementParsed{
+	    DecodeResult::Ok(ElementDecoded{
 		element: Element::Dict(vec![
-		    DictEntry{ key: "a".as_bytes().to_vec(), value: Element::Integer(10) }
+		    DictEntry{ key: b"a".to_vec(), value: Element::Integer(10) }
 		]),
 		end_offset: input.len(),
 	    })
 	);
 
-	let input = "d4:listli10ei1el1:beee1:a".as_bytes();
-	let result = parse_dict(input);
+	let input = b"d4:listli10ei1el1:beee1:a";
+	let result = decode_dict(input);
 	assert_eq!(
 	    result,
-	    ParseResult::Ok(ElementParsed{
+	    DecodeResult::Ok(ElementDecoded{
 		element: Element::Dict(vec![
 		    DictEntry{
-			key: "list".as_bytes().to_vec(),
+			key: b"list".to_vec(),
 			value: Element::List(vec![
 			    Element::Integer(10),
 			    Element::Integer(1),
 			    Element::List(vec![
-				Element::ByteString("b".as_bytes().to_vec()),
+				Element::ByteString(b"b".to_vec()),
 			    ]),
 			])
 		    }
@@ -423,80 +552,80 @@ mod tests {
     
     #[test]
     fn dispatch_happy_path() {
-	let input = "8:announce".as_bytes();
-	let result: ParseResult = dispatch(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
-	    element: Element::ByteString("announce".as_bytes().to_vec()),
+	let input = b"8:announce";
+	let result: DecodeResult = dispatch(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
+	    element: Element::ByteString(b"announce".to_vec()),
 	    end_offset: input.len(),
 	}));
 
-	let input = "i-18e".as_bytes();
-	let result: ParseResult = dispatch(input);
-	assert_eq!(result, ParseResult::Ok(ElementParsed{
+	let input = b"i-18e";
+	let result: DecodeResult = dispatch(input);
+	assert_eq!(result, DecodeResult::Ok(ElementDecoded{
 	    element: Element::Integer(-18),
 	    end_offset: input.len(),
 	}));
     }
 
     #[test]
-    fn parse_happy_path() {
+    fn decode_happy_path() {
 	assert_eq!(
-	    parse("8:announce".as_bytes()),
-	    ParsedDocument::Ok(vec![
+	    decode(b"8:announce"),
+	    DecodedDocument::Ok(vec![
 		Element::ByteString("announce".as_bytes().to_vec())
 	    ])
 	);
 
 	assert_eq!(
-	    parse("i-18e".as_bytes()),
-	    ParsedDocument::Ok(vec![
+	    decode(b"i-18e"),
+	    DecodedDocument::Ok(vec![
 		Element::Integer(-18)
 	    ])
 	);
 
 	assert_eq!(
-	    parse("8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by".as_bytes()),
-	    ParsedDocument::Ok(vec![
-		Element::ByteString("announce".as_bytes().to_vec()),
-		Element::ByteString("http://bttracker.debian.org:6969/announce".as_bytes().to_vec()),
-		Element::ByteString("comment".as_bytes().to_vec()),
-		Element::ByteString("\"Debian CD from cdimage.debian.org\"".as_bytes().to_vec()),
-		Element::ByteString("created by".as_bytes().to_vec()),
+	    decode(b"8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by"),
+	    DecodedDocument::Ok(vec![
+		Element::ByteString(b"announce".to_vec()),
+		Element::ByteString(b"http://bttracker.debian.org:6969/announce".to_vec()),
+		Element::ByteString(b"comment".to_vec()),
+		Element::ByteString(b"\"Debian CD from cdimage.debian.org\"".to_vec()),
+		Element::ByteString(b"created by".to_vec()),
 	    ])
 	);
 
 	assert_eq!(
-	    parse("li10ei1el1:bee1:a".as_bytes()),
-	    ParsedDocument::Ok(vec![
+	    decode(b"li10ei1el1:bee1:a"),
+	    DecodedDocument::Ok(vec![
 		Element::List(vec![
 		    Element::Integer(10),
 		    Element::Integer(1),
 		    Element::List(vec![
-			Element::ByteString("b".as_bytes().to_vec()),
+			Element::ByteString(b"b".to_vec()),
 		    ]),
 		]),
-		Element::ByteString("a".as_bytes().to_vec()),
+		Element::ByteString(b"a".to_vec()),
 	    ])
 	);
 
 	assert_eq!(
-	    parse("d8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by13:mktorrent 1.113:creation datei1662813552ee".as_bytes()),
-	    ParsedDocument::Ok(vec![
+	    decode(b"d8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"10:created by13:mktorrent 1.113:creation datei1662813552ee"),
+	    DecodedDocument::Ok(vec![
 		Element::Dict(vec![
 		    DictEntry{
-			key: "announce".as_bytes().to_vec(),
-			value: Element::ByteString("http://bttracker.debian.org:6969/announce".as_bytes().to_vec())
+			key: b"announce".to_vec(),
+			value: Element::ByteString(b"http://bttracker.debian.org:6969/announce".to_vec())
 		    },
 		    DictEntry{
-			key: "comment".as_bytes().to_vec(),
-			value: Element::ByteString("\"Debian CD from cdimage.debian.org\"".as_bytes().to_vec())
+			key: b"comment".to_vec(),
+			value: Element::ByteString(b"\"Debian CD from cdimage.debian.org\"".to_vec())
 		    },
 		    DictEntry{
-			key: "created by".as_bytes().to_vec(),
-			value: Element::ByteString("mktorrent 1.1".as_bytes().to_vec())
+			key: b"created by".to_vec(),
+			value: Element::ByteString(b"mktorrent 1.1".to_vec())
 		    },
 		    DictEntry{
-			key: "creation date".as_bytes().to_vec(),
+			key: b"creation date".to_vec(),
 			value: Element::Integer(1662813552)
 		    },
 		]),
