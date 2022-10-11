@@ -1,4 +1,6 @@
 use base64;
+use sha1::{Sha1, Digest};
+use urlencoding;
 
 #[derive(Debug)]
 #[derive(PartialEq)]
@@ -313,6 +315,17 @@ fn decode_dict(data: &[u8]) -> DecodeResult {
 			    Element::ByteString(key) => {
 				match dispatch(&data[offset+decode_key.end_offset..]) {
 				    DecodeResult::Ok(result) => {
+					if key == b"info" { // I hate this hack.
+					    let dict_start = offset + decode_key.end_offset;
+					    let dict_end = dict_start + result.end_offset;
+					    let digest = Sha1::digest(&data[dict_start..dict_end]);
+					    ret.push(DictEntry{ key: b"infohash".to_vec(), value: Element::ByteString(digest.to_vec()) });
+					    ret.push(DictEntry{
+						key: b"infohash_urlencoded".to_vec(),
+						value: Element::ByteString(urlencoding::encode_binary(&digest).into_owned().as_bytes().to_vec())
+					    });
+					}
+
 					ret.push(DictEntry{ key: key, value: result.element });
 					offset += result.end_offset + decode_key.end_offset
 				    },
@@ -528,6 +541,20 @@ mod tests {
 	    })
 	);
 
+	let input = b"d4:infoi10ee";
+	let result = decode_dict(input);
+	assert_eq!(
+	    result,
+	    DecodeResult::Ok(ElementDecoded{
+		element: Element::Dict(vec![
+		    DictEntry{ key: b"infohash".to_vec(), value: Element::ByteString(vec![20, 109, 137, 35, 247, 72, 143, 150, 118, 128, 161, 174, 239, 100, 102, 102, 43, 43, 183, 14]) },
+		    DictEntry { key: b"infohash_urlencoded".to_vec(), value: Element::ByteString(vec![37, 49, 52, 109, 37, 56, 57, 37, 50, 51, 37, 70, 55, 72, 37, 56, 70, 37, 57, 54, 118, 37, 56, 48, 37, 65, 49, 37, 65, 69, 37, 69, 70, 100, 102, 102, 37, 50, 66, 37, 50, 66, 37, 66, 55, 37, 48, 69]) },
+		    DictEntry{ key: b"info".to_vec(), value: Element::Integer(10) }
+		]),
+		end_offset: input.len(),
+	    })
+	);
+
 	let input = b"d4:listli10ei1el1:beee1:a";
 	let result = decode_dict(input);
 	assert_eq!(
@@ -633,3 +660,4 @@ mod tests {
 	);
     }
 }
+
